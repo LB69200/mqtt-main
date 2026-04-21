@@ -4,6 +4,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define TELIT_UART_NODE  DT_NODELABEL(uart21)
 #define BUF_SIZE         256
@@ -20,6 +21,7 @@
 #define MQTT_USER        "LBLABOURGADE"
 #define MQTT_PASS        "d3lc2rr0@4M33!"
 #define MQTT_TOPIC_WIFI  "tracker/wifi"
+#define MQTT_TOPIC_GNSS  "tracker/gnss"
 #define MQTT_BUF_SIZE    512
 
 K_MSGQ_DEFINE(telit_msgq, BUF_SIZE, 16, 4);
@@ -31,6 +33,7 @@ static char rx_buf[BUF_SIZE];
 static int  rx_buf_pos;
 
 static char mqtt_payload[MQTT_BUF_SIZE];
+static char gnss_payload[64];
 
 /* ── ISR réception UART : découpe les lignes et les met en file ───── */
 static void telit_rx_cb(const struct device *dev, void *user_data)
@@ -174,7 +177,42 @@ static int is_gnss_fix(const char *line)
 	return comma && *(comma + 1) == 'A';
 }
 
-/* ── Détecte +CEREG: n,stat (stat 1=home, 5=roaming) ───────────────── */
+/* ── Retourne le Nième champ d'une trame NMEA (séparateur ',') ───────── */
+static const char *nmea_field(const char *s, int n)
+{
+	for (int i = 0; i < n; i++) {
+		s = strchr(s, ',');
+		if (!s) return NULL;
+		s++;
+	}
+	return s;
+}
+
+/* ── Parse $GPRMC/$GNRMC et remplit gnss_payload en degrés décimaux ──── */
+static void gnss_build_payload(const char *line)
+{
+	const char *f3 = nmea_field(line, 3); /* DDMM.MMMM lat  */
+	const char *f4 = nmea_field(line, 4); /* N/S            */
+	const char *f5 = nmea_field(line, 5); /* DDDMM.MMMM lon */
+	const char *f6 = nmea_field(line, 6); /* E/W            */
+
+	if (!f3 || !f4 || !f5 || !f6 || *f3 == ',' || *f5 == ',') return;
+
+	/* DDMM.MMMM → degrés décimaux */
+	double lat_raw = atof(f3);
+	int    lat_deg = (int)(lat_raw / 100);
+	double lat     = lat_deg + (lat_raw - lat_deg * 100.0) / 60.0;
+	if (*f4 == 'S') lat = -lat;
+
+	double lon_raw = atof(f5);
+	int    lon_deg = (int)(lon_raw / 100);
+	double lon     = lon_deg + (lon_raw - lon_deg * 100.0) / 60.0;
+	if (*f6 == 'W') lon = -lon;
+
+	snprintf(gnss_payload, sizeof(gnss_payload), "%.6f,%.6f", lat, lon);
+}
+
+/* ── Détecdte +CEREG: n,stat (stat 1=home, 5=roaming) ───────────────── */
 static int cereg_is_registered(const char *line)
 {
 	const char *p = strstr(line, "+CEREG:");
@@ -212,12 +250,13 @@ static void wait_lte_registered(int timeout_ms)
 	printk("[LTE] Timeout re-enregistrement\n");
 }
 
-/* ── Cycle GNSS : CFUN=4, fix, stop, retour CFUN=1 ─────────────────── */
+/* ── Cycle GNSS : CFUN=4, fix, stop, retour Cmais what ?FUN=1+5 ───────────────── */
 static int gnss_scan_cycle(void)
 {
 	char line[BUF_SIZE];
 	int  got_fix = 0;
 
+	gnss_payload[0] = '\0';
 	printk("=== Cycle GNSS (timeout %d s) ===\n", GNSS_TIMEOUT_MS / 1000);
 
 	send_at("AT+CFUN=4");
@@ -239,7 +278,8 @@ static int gnss_scan_cycle(void)
 				print_line(line);
 				if (is_gnss_fix(line)) {
 					got_fix = 1;
-					printk("[GNSS] Fix obtenu!\n");
+					gnss_build_payload(line);
+					printk("[GNSS] Fix : %s\n", gnss_payload);
 					int64_t hold = k_uptime_get() + GNSS_FIX_HOLD_MS;
 					while (k_uptime_get() < hold) {
 						if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0)
@@ -263,6 +303,9 @@ restore_lte:
 	send_at("AT+CFUN=1");
 	wait_for("OK", 10000);
 	wait_lte_registered(60000);
+	/* CFUN=5 doit être re-appliqué : CFUN=1 l'a effacé */
+	send_at("AT+CFUN=5");
+	wait_for("OK", 5000);
 
 	return got_fix;
 }
@@ -412,6 +455,22 @@ static void mqtt_publish_wifi(void)
 	}
 }
 
+/* ── Publication MQTT des données GNSS ─────────────────────────────── */
+static void mqtt_publish_gnss(void)
+{
+	char cmd[128];
+
+	snprintf(cmd, sizeof(cmd),
+		 "AT#MQPUBS=1,\"" MQTT_TOPIC_GNSS "\",1,0,\"%s\"", gnss_payload);
+	send_at(cmd);
+
+	if (wait_for("OK", 10000) != 0) {
+		printk("[MQTT] Echec publication GNSS\n");
+	} else {
+		printk("[MQTT] Publie sur " MQTT_TOPIC_GNSS " : %s\n", gnss_payload);
+	}
+}
+
 /* ── Déconnexion MQTT ───────────────────────────────────────────────── */
 static void mqtt_disconnect(void)
 {
@@ -501,10 +560,12 @@ int main(void)
 	/* ── Boucle principale : scan -> MQTT -> veille -> réveil -> répéter ── */
 	while (1) {
 		wifi_scan_cycle();
-		/* gnss_scan_cycle(); */ /* GNSS désactivé - antenne débranchée */
+		int got_fix = gnss_scan_cycle();
 
 		if (mqtt_connect() == 0) {
 			mqtt_publish_wifi();
+			if (got_fix)
+				mqtt_publish_gnss();
 			mqtt_disconnect();
 		}
 

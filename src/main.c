@@ -361,7 +361,7 @@ restore_lte:
 	return got_fix;
 }
 
-/* ── Initialisation WiFi (à appeler au boot ET après chaque réveil DTR) ── */
+/* ── Initialihsation WiFi (à appeler au boot ET après chaque réveil DTR) ── */
 static void wifi_init(void)
 {
 	send_at("AT%WIFICFG=\"SET\",\"CHANNEL\",1,6,11");

@@ -12,8 +12,10 @@
 #define NB_SCANS         3       /* nombre de scans WiFi par cycle         */
 #define SLEEP_MS         300000  /* durée de veille : 5 minutes            */
 #define SLEEP_MIN        (SLEEP_MS / 60000)
-#define GNSS_TIMEOUT_MS  120000  /* 2 min max pour obtenir un fix GNSS     */
-#define GNSS_FIX_HOLD_MS   5000  /* lectures conservées après le fix       */
+#define GNSS_TIMEOUT_MS      120000  /* 2 min max pour le premier fix GNSS     */
+#define GNSS_REFIX_TIMEOUT_MS 60000  /* 1 min max pour un re-fix après arrêt   */
+#define GNSS_FRAMES_PER_SEND      5  /* trames valides avant chaque envoi      */
+#define GNSS_SEND_COUNT           5  /* nombre d'envois GNSS par cycle         */
 
 #define MQTT_BROKER      "c6f757b2957040889bf448086d07d8a2.s1.eu.hivemq.cloud"
 #define MQTT_PORT        8883
@@ -280,9 +282,12 @@ static void wait_lte_registered(int timeout_ms)
 {
 	char line[BUF_SIZE];
 	int64_t deadline = k_uptime_get() + timeout_ms;
+	int idle_count = 0; /* CEREG=0,0 consécutifs : module détaché */
 
 	printk("[LTE] Attente re-enregistrement...\n");
 	while (k_uptime_get() < deadline) {
+		int got_idle = 1; /* présumé idle jusqu'à preuve du contraire */
+
 		send_at("AT+CEREG?");
 		int64_t resp_end = k_uptime_get() + 3000;
 		while (k_uptime_get() < resp_end) {
@@ -293,72 +298,162 @@ static void wait_lte_registered(int timeout_ms)
 					drain_queue(500);
 					return;
 				}
+				/* stat=2 (recherche) ou stat=3 (enregistrement refusé) :
+				 * le module tente activement, pas idle */
+				if (strstr(line, "+CEREG:") &&
+				    !strstr(line, ": 0,0") && !strstr(line, ",0\r"))
+					got_idle = 0;
 				if (strstr(line, "OK")) break;
 			}
 		}
+
+		if (got_idle) {
+			idle_count++;
+			if (idle_count >= 3) {
+				/* Module détaché (CEREG=0,0 x3) : forcer ré-attachement */
+				printk("[LTE] Module detache, ré-attachement force...\n");
+				send_at("AT+CFUN=0");
+				wait_for("OK", 10000);
+				k_msleep(2000);
+				send_at("AT+CFUN=1");
+				wait_for("OK", 10000);
+				idle_count = 0;
+			}
+		} else {
+			idle_count = 0;
+		}
+
 		k_msleep(3000);
 	}
 	printk("[LTE] Timeout re-enregistrement\n");
 }
 
-/* ── Cycle GNSS : CFUN=4, fix, stop, retour Cmais what ?FUN=1+5 ───────────────── */
-static int gnss_scan_cycle(void)
+static int  mqtt_init(void);
+static int  mqtt_connect(void);
+static void mqtt_publish_gnss(void);
+static void mqtt_disconnect(void);
+
+/* ── Retour LTE après une session GNSS (CFUN=4 → CFUN=1 → LTE → CFUN=5) ── */
+static void gnss_restore_lte(void)
 {
-	char line[BUF_SIZE];
-	int  got_fix = 0;
-
-	gnss_payload[0] = '\0';
-	printk("=== Cycle GNSS (timeout %d s) ===\n", GNSS_TIMEOUT_MS / 1000);
-
-	send_at("AT+CFUN=4");
-	wait_for("OK", 10000);
-
-	send_at("AT$GPSP=1");
-	if (wait_for("OK", 5000) != 0) {
-		printk("[GNSS] Echec demarrage GNSS\n");
-		goto restore_lte;
-	}
-
-	send_at("AT$GNSSNMEA=1,1");
-	wait_for("OK", 3000);
-
-	{
-		int64_t end = k_uptime_get() + GNSS_TIMEOUT_MS;
-		while (k_uptime_get() < end) {
-			if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0) {
-				print_line(line);
-				if (is_gnss_fix(line)) {
-					got_fix = 1;
-					gnss_build_payload(line);
-					printk("[GNSS] Fix : %s\n", gnss_payload);
-					int64_t hold = k_uptime_get() + GNSS_FIX_HOLD_MS;
-					while (k_uptime_get() < hold) {
-						if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0)
-							print_line(line);
-					}
-					break;
-				}
-			}
-		}
-	}
-
-	if (!got_fix)
-		printk("[GNSS] Pas de fix dans le delai imparti\n");
-
-	send_at("AT$GNSSNMEA=0,0");
-	wait_for("OK", 3000);
-	send_at("AT$GPSP=0");
-	wait_for("OK", 5000);
-
-restore_lte:
 	send_at("AT+CFUN=1");
 	wait_for("OK", 10000);
 	wait_lte_registered(60000);
-	/* CFUN=5 doit être re-appliqué : CFUN=1 l'a effacé */
+
+	/* CFUN=4 désactive le contexte PDP — le ré-activer si besoin. */
+	send_at("AT#SGACT?");
+	if (wait_for("#SGACT: 1,1", 3000) != 0) {
+		send_at("AT#SGACT=1,1");
+		wait_for("#SGACT:", 30000);
+		wait_for("OK", 5000);
+	} else {
+		drain_queue(200);
+	}
+
+	/* Si CFUN=4 a effacé la config MQTT (broker vide), refaire mqtt_init.
+	 * Si la config est déjà là, ne pas toucher : MQCONN marchera direct
+	 * et tenter de reconfigurer SSL casserait la liaison existante. */
+	{
+		char cfg_line[BUF_SIZE];
+		int  broker_set = 0;
+
+		send_at("AT#MQCFG?");
+		int64_t t = k_uptime_get() + 3000;
+		while (k_uptime_get() < t) {
+			if (k_msgq_get(&telit_msgq, cfg_line, K_MSEC(200)) == 0) {
+				print_line(cfg_line);
+				if (strstr(cfg_line, "#MQCFG: 1,") &&
+				    !strstr(cfg_line, "1,\"\""))
+					broker_set = 1;
+				if (strstr(cfg_line, "OK")) break;
+			}
+		}
+		if (!broker_set)
+			mqtt_init();
+	}
+
 	send_at("AT+CFUN=5");
 	wait_for("OK", 5000);
+}
 
-	return got_fix;
+/* ── Tracking GNSS : GNSS_SEND_COUNT envois, chacun après GNSS_FRAMES_PER_SEND trames valides ── */
+static void gnss_tracking_cycle(void)
+{
+	char line[BUF_SIZE];
+	int  publish_count = 0;
+
+	gnss_payload[0] = '\0';
+	printk("=== Tracking GNSS : %d envois x %d trames ===\n",
+	       GNSS_SEND_COUNT, GNSS_FRAMES_PER_SEND);
+
+	while (publish_count < GNSS_SEND_COUNT) {
+		int valid_count = 0;
+		int timeout_ms = (publish_count == 0) ? GNSS_TIMEOUT_MS
+						       : GNSS_REFIX_TIMEOUT_MS;
+
+		/* --- Passe en mode GNSS (radio off) --- */
+		send_at("AT+CFUN=4");
+		wait_for("OK", 10000);
+		k_msleep(1000); /* stabilisation avant GPSP */
+
+		send_at("AT$GPSP=0"); /* arrêt préventif si GNSS déjà actif */
+		wait_for("OK", 3000);
+
+		send_at("AT$GPSP=1");
+		if (wait_for("OK", 10000) != 0) {
+			printk("[GNSS] Echec demarrage GNSS\n");
+			gnss_restore_lte();
+			return;
+		}
+
+		send_at("AT$GNSSNMEA=1,1");
+		wait_for("OK", 3000);
+
+		/* --- Accumule GNSS_FRAMES_PER_SEND trames valides --- */
+		{
+			int64_t end = k_uptime_get() + timeout_ms;
+			while (k_uptime_get() < end) {
+				if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0) {
+					print_line(line);
+					if (is_gnss_fix(line)) {
+						gnss_build_payload(line);
+						valid_count++;
+						printk("[GNSS] Trame %d/%d : %s\n",
+						       valid_count,
+						       GNSS_FRAMES_PER_SEND,
+						       gnss_payload);
+						if (valid_count >= GNSS_FRAMES_PER_SEND)
+							break;
+					}
+				}
+			}
+		}
+
+		/* --- Arrêt GNSS --- */
+		send_at("AT$GNSSNMEA=0,0");
+		wait_for("OK", 3000);
+		send_at("AT$GPSP=0");
+		wait_for("OK", 5000);
+
+		/* --- Retour LTE --- */
+		gnss_restore_lte();
+
+		if (valid_count < GNSS_FRAMES_PER_SEND) {
+			printk("[GNSS] Seulement %d/%d trames, fin tracking\n",
+			       valid_count, GNSS_FRAMES_PER_SEND);
+			return;
+		}
+
+		/* --- Envoi MQTT --- */
+		if (mqtt_connect() == 0) {
+			mqtt_publish_gnss();
+			mqtt_disconnect();
+			publish_count++;
+			printk("[GNSS] Envoi %d/%d OK\n", publish_count, GNSS_SEND_COUNT);
+		}
+	}
+
+	printk("[GNSS] Tracking termine : %d positions envoyees\n", GNSS_SEND_COUNT);
 }
 
 /* ── Initialihsation WiFi (à appeler au boot ET après chaque réveil DTR) ── */
@@ -541,7 +636,6 @@ int main(void)
 	gpio_pin_configure(gpio1_dev, DTR_PIN, GPIO_OUTPUT_LOW);
 	dtr_set(1);
 
-	/* --- Init UART --- */
 	if (!device_is_ready(telit_uart)) {
 		printk("UART non prêt\n");
 		return -1;
@@ -593,6 +687,11 @@ int main(void)
 	/* --- Configuration WiFi initiale --- */
 	wifi_init();
 
+	/* --- Initialisation MQTT+SSL en CFUN=1 (radio pleine) avant eDRX ---
+	 * MQCFG échoue systématiquement en CFUN=5 ("connection failed") :
+	 * on configure le broker ici pendant que CFUN=1 est encore actif. */
+	mqtt_init();
+
 	/* --- Activation eDRX piloté par DTR ---
 	 * CFUN=5 : module entre en veille dès que DTR passe au niveau "sleep".
 	 * Après CFUN=5, un front DTR sleep→wake est nécessaire pour démarrer
@@ -605,18 +704,13 @@ int main(void)
 	dtr_set(1);        /* front montant  : DTR -> "wake"  → module actif */
 	k_msleep(3000);
 
-	/* --- Initialisation MQTT+SSL : une seule fois, config persiste en veille --- */
-	mqtt_init();
-
 	/* ── Boucle principale : scan -> MQTT -> veille -> réveil -> répéter ── */
 	while (1) {
 		wifi_scan_cycle();
-		int got_fix = gnss_scan_cycle();
+		gnss_tracking_cycle();
 
 		if (mqtt_connect() == 0) {
 			mqtt_publish_wifi();
-			if (got_fix)
-				mqtt_publish_gnss();
 			mqtt_disconnect();
 		}
 

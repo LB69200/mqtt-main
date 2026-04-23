@@ -10,12 +10,12 @@
 #define BUF_SIZE         256
 #define DTR_PIN          11      /* P1.11 -> EVB GPIO01 -> module C108/DTR */
 #define NB_SCANS         3       /* nombre de scans WiFi par cycle         */
-#define SLEEP_MS         300000  /* durée de veille : 5 minutes            */
+#define SLEEP_MS        1200000  /* durée de veille : 20 minutes           */
 #define SLEEP_MIN        (SLEEP_MS / 60000)
 #define GNSS_TIMEOUT_MS      120000  /* 2 min max pour le premier fix GNSS     */
 #define GNSS_REFIX_TIMEOUT_MS 60000  /* 1 min max pour un re-fix après arrêt   */
-#define GNSS_FRAMES_PER_SEND      5  /* trames valides avant chaque envoi      */
-#define GNSS_SEND_COUNT           5  /* nombre d'envois GNSS par cycle         */
+#define CYCLE_COUNT               5  /* cycles wifi+gnss par session           */
+#define GNSS_CYCLE_MIN_MS     20000  /* délai min entre deux cycles            */
 
 #define MQTT_BROKER      "c6f757b2957040889bf448086d07d8a2.s1.eu.hivemq.cloud"
 #define MQTT_PORT        8883
@@ -190,7 +190,6 @@ static const char *nmea_field(const char *s, int n)
 	return s;
 }
 
-/* ── Parse $GPRMC/$GNRMC et remplit gnss_payload en degrés décimaux ──── */
 /* ── Parse $GPRMC/$GNRMC et remplit gnss_payload en degrés décimaux ──── */
 static void gnss_build_payload(const char *line)
 {
@@ -376,87 +375,58 @@ static void gnss_restore_lte(void)
 	wait_for("OK", 5000);
 }
 
-/* ── Tracking GNSS : GNSS_SEND_COUNT envois, chacun après GNSS_FRAMES_PER_SEND trames valides ── */
-static void gnss_tracking_cycle(void)
+/* ── Capture un seul fix GNSS puis restaure le LTE ──────────────────── */
+static int gnss_one_fix(void)
 {
-	char line[BUF_SIZE];
-	int  publish_count = 0;
+	char    line[BUF_SIZE];
+	int     got_fix = 0;
+	static  int first = 1;
+	int     timeout = first ? GNSS_TIMEOUT_MS : GNSS_REFIX_TIMEOUT_MS;
 
-	gnss_payload[0] = '\0';
-	printk("=== Tracking GNSS : %d envois x %d trames ===\n",
-	       GNSS_SEND_COUNT, GNSS_FRAMES_PER_SEND);
+	send_at("AT+CFUN=4");
+	wait_for("OK", 10000);
+	k_msleep(1000);
 
-	while (publish_count < GNSS_SEND_COUNT) {
-		int valid_count = 0;
-		int timeout_ms = (publish_count == 0) ? GNSS_TIMEOUT_MS
-						       : GNSS_REFIX_TIMEOUT_MS;
+	send_at("AT$GPSP=0");
+	wait_for("OK", 3000);
 
-		/* --- Passe en mode GNSS (radio off) --- */
-		send_at("AT+CFUN=4");
-		wait_for("OK", 10000);
-		k_msleep(1000); /* stabilisation avant GPSP */
-
-		send_at("AT$GPSP=0"); /* arrêt préventif si GNSS déjà actif */
-		wait_for("OK", 3000);
-
-		send_at("AT$GPSP=1");
-		if (wait_for("OK", 10000) != 0) {
-			printk("[GNSS] Echec demarrage GNSS\n");
-			gnss_restore_lte();
-			return;
-		}
-
+	send_at("AT$GPSP=1");
+	if (wait_for("OK", 10000) == 0) {
 		send_at("AT$GNSSNMEA=1,1");
 		wait_for("OK", 3000);
 
-		/* --- Accumule GNSS_FRAMES_PER_SEND trames valides --- */
-		{
-			int64_t end = k_uptime_get() + timeout_ms;
-			while (k_uptime_get() < end) {
-				if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0) {
-					print_line(line);
-					if (is_gnss_fix(line)) {
-						gnss_build_payload(line);
-						valid_count++;
-						printk("[GNSS] Trame %d/%d : %s\n",
-						       valid_count,
-						       GNSS_FRAMES_PER_SEND,
-						       gnss_payload);
-						if (valid_count >= GNSS_FRAMES_PER_SEND)
-							break;
-					}
+		int64_t fix_start    = k_uptime_get();
+		int64_t fix_deadline = fix_start + timeout;
+
+		while (!got_fix && k_uptime_get() < fix_deadline) {
+			if (k_msgq_get(&telit_msgq, line, K_MSEC(200)) == 0) {
+				print_line(line);
+				if (is_gnss_fix(line)) {
+					gnss_build_payload(line);
+					printk("[GNSS] Fix en %lld ms : %s\n",
+					       (long long)(k_uptime_get() - fix_start),
+					       gnss_payload);
+					got_fix = 1;
+					first   = 0;
 				}
 			}
 		}
-
-		/* --- Arrêt GNSS --- */
 		send_at("AT$GNSSNMEA=0,0");
 		wait_for("OK", 3000);
-		send_at("AT$GPSP=0");
-		wait_for("OK", 5000);
-
-		/* --- Retour LTE --- */
-		gnss_restore_lte();
-
-		if (valid_count < GNSS_FRAMES_PER_SEND) {
-			printk("[GNSS] Seulement %d/%d trames, fin tracking\n",
-			       valid_count, GNSS_FRAMES_PER_SEND);
-			return;
-		}
-
-		/* --- Envoi MQTT --- */
-		if (mqtt_connect() == 0) {
-			mqtt_publish_gnss();
-			mqtt_disconnect();
-			publish_count++;
-			printk("[GNSS] Envoi %d/%d OK\n", publish_count, GNSS_SEND_COUNT);
-		}
+	} else {
+		printk("[GNSS] Echec GPSP=1\n");
 	}
 
-	printk("[GNSS] Tracking termine : %d positions envoyees\n", GNSS_SEND_COUNT);
+	send_at("AT$GPSP=0");
+	wait_for("OK", 5000);
+
+	gnss_restore_lte();
+
+	if (!got_fix) printk("[GNSS] Pas de fix\n");
+	return got_fix;
 }
 
-/* ── Initialihsation WiFi (à appeler au boot ET après chaque réveil DTR) ── */
+/* ── Initialisation WiFi (à appeler au boot ET après chaque réveil DTR) ── */
 static void wifi_init(void)
 {
 	send_at("AT%WIFICFG=\"SET\",\"CHANNEL\",1,6,11");
@@ -498,15 +468,6 @@ static void wifi_scan_cycle(void)
 /* ── Initialisation MQTT+SSL — appelée UNE SEULE FOIS au boot ───────── */
 static int mqtt_init(void)
 {
-	/* --- Diagnostic : état actuel du module avant toute modification --- */
-	printk("[DIAG] === Etat module avant init ===\n");
-	send_at("AT#MQEN?");
-	wait_for("OK", 2000);
-	send_at("AT#MQCFG?");
-	wait_for("OK", 2000);
-	send_at("AT#MQCONN?");
-	wait_for("OK", 2000);
-
 	printk("[MQTT] Init -> %s:%d\n", MQTT_BROKER, MQTT_PORT);
 
 	/* 1. Déconnecter et désactiver MQTT pour libérer toute liaison SSL */
@@ -552,13 +513,6 @@ static int mqtt_init(void)
 	/* 5. Réactiver SSL pour l'utilisation réelle */
 	send_at("AT#SSLEN=1,1");
 	wait_for("OK", 3000);
-
-	/* --- Diagnostic : état après init --- */
-	printk("[DIAG] === Etat module apres init ===\n");
-	send_at("AT#MQEN?");
-	wait_for("OK", 2000);
-	send_at("AT#MQCFG?");
-	wait_for("OK", 2000);
 
 	printk("[MQTT] Initialise\n");
 	return 0;
@@ -704,27 +658,41 @@ int main(void)
 	dtr_set(1);        /* front montant  : DTR -> "wake"  → module actif */
 	k_msleep(3000);
 
-	/* ── Boucle principale : scan -> MQTT -> veille -> réveil -> répéter ── */
+	/* ── Boucle principale : 1 scan WiFi puis CYCLE_COUNT cycles gnss+mqtt ── */
 	while (1) {
+		int ok_count = 0;
+
 		wifi_scan_cycle();
-		gnss_tracking_cycle();
 
 		if (mqtt_connect() == 0) {
 			mqtt_publish_wifi();
 			mqtt_disconnect();
 		}
 
-		print_next_scan_time();
+		for (int i = 0; i < CYCLE_COUNT; i++) {
+			int64_t t_start = k_uptime_get();
+			printk("\n=== Cycle %d/%d ===\n", i + 1, CYCLE_COUNT);
 
-		printk("\n--- Passage en veille (DTR LOW) - réveil dans %d s (%d min) ---\n",
-		       SLEEP_MS / 1000, SLEEP_MS / 60000);
+			if (gnss_one_fix() && mqtt_connect() == 0) {
+				mqtt_publish_gnss();
+				mqtt_disconnect();
+				ok_count++;
+			}
+
+			int64_t leftover = GNSS_CYCLE_MIN_MS - (k_uptime_get() - t_start);
+			if (leftover > 0) k_msleep((int32_t)leftover);
+		}
+
+		print_next_scan_time();
+		printk("=== Session : %d/%d OK — veille %d s ===\n",
+		       ok_count, CYCLE_COUNT, SLEEP_MS / 1000);
+
 		dtr_set(0);
 		k_msleep(SLEEP_MS);
-
-		printk("--- Réveil (DTR HIGH) ---\n");
+		printk("--- Réveil ---\n");
 		dtr_set(1);
-		k_msleep(3000); /* laisse le temps au module de se réveiller */
-		wifi_init();    /* re-initialise le WiFi après la veille DTR */
+		k_msleep(3000);
+		wifi_init();
 	}
 
 	return 0;
